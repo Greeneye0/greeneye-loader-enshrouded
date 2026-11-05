@@ -1,0 +1,11 @@
+# build output
+build/
+bin/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+
+# release archives are attached to GitHub releases, not committed
+dist/*.zip

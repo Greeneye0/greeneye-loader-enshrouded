@@ -1,0 +1,1 @@
+Greeneye Loader 1.2.0: a hot reload can now add new hooks (needs greeneye\hotreload.enable; for mod developers). Nothing changes for players.
