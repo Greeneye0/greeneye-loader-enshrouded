@@ -3,7 +3,7 @@
 #include <string>
 #include "greeneye.h"
 
-#define GL_VERSION "1.2.2"
+#define GL_VERSION "1.2.3"
 
 void Log(const char* fmt, ...);
 std::string Narrow(const std::wstring& w);

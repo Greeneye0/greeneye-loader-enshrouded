@@ -18,7 +18,7 @@ The loader is a proxy DLL. Every export of the Windows `dbgcore`, `umpdc` and `c
 
 Loaded as `dbgcore.dll`, it starts the mods at the exe's entry point, before any game code runs and outside the loader lock. Loaded under the other two names it arrives later, so the mods start right away.
 
-What it did, and why it skipped a mod, is written to `greeneye\loader.log`. Please include that file in a bug report.
+What it did, and why it skipped a mod, is written to `greeneyeoader.log`. Please include that file in a bug report. It starts fresh with each game or server start and rolls over at 10 MB: the earlier part moves to `loader.old.log`.
 
 ## Writing a mod
 

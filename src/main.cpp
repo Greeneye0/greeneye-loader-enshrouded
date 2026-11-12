@@ -22,6 +22,28 @@
 
 namespace {
 async_log::Writer g_log;
+std::wstring g_logPath, g_oldLogPath;
+
+// loader.log rolls over at 10 MB: the full one becomes loader.old.log (the one before goes), so a
+// long session keeps its last 10-20 MB. A server ran 13 h with a portal mod logging every tick and
+// left a 503 MB loader.log (2026-11-12). Called by the writer after each flush, under its lock.
+constexpr long long kRollBytes = 10LL * 1024 * 1024;
+bool g_rollFailed = false; // the file can't be renamed (open elsewhere): left to grow until the next start
+
+void RollIfFull(FILE*& file)
+{
+    if (!file || g_rollFailed || _ftelli64(file) <= kRollBytes)
+        return;
+    fclose(file);
+    if (!MoveFileExW(g_logPath.c_str(), g_oldLogPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        g_rollFailed = true;
+        file = _wfsopen(g_logPath.c_str(), L"a", _SH_DENYWR);
+        return;
+    }
+    file = _wfsopen(g_logPath.c_str(), L"w", _SH_DENYWR);
+    if (file)
+        std::fputs("[log continued: the earlier part is in loader.old.log]\n", file);
+}
 }
 
 void Log(const char* fmt, ...)
@@ -277,7 +299,9 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
         }
         return TRUE;
     }
-    g_log.Open(_wfsopen((g_modsDir + L"loader.log").c_str(), L"w", _SH_DENYWR));
+    g_logPath = g_modsDir + L"loader.log";
+    g_oldLogPath = g_modsDir + L"loader.old.log";
+    g_log.Open(_wfsopen(g_logPath.c_str(), L"w", _SH_DENYWR), &RollIfFull);
     Log("Greeneye Loader " GL_VERSION " loaded as %s in %s (%s), %lld ms after start, %s load", g_selfName.c_str(),
         Narrow(exeName).c_str(), g_side == kGreeneyeServer ? "server" : "game", MsSinceStart(),
         reserved ? "start-up" : "late");
