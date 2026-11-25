@@ -9,3 +9,6 @@ bin/
 
 # release archives are attached to GitHub releases, not committed
 dist/*.zip
+
+# python caches
+__pycache__/

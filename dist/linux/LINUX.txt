@@ -1,0 +1,166 @@
+Greeneye Loader on Linux (Steam Deck, Proton, Wine)
+====================================================
+
+Windows players: you don't need anything in this file.
+
+On Linux the loader can't run under its usual name, dbgcore.dll, because Wine never loads that
+name. It runs as dinput8.dll instead. It's the same file, renamed.
+
+
+1. Rename the loader
+--------------------
+
+In the game folder (the one with enshrouded.exe), or the server folder (the one with
+enshrouded_server.exe):
+
+    rename  dbgcore.dll  to  dinput8.dll
+
+Keep the greeneye folder where it is.
+
+This needs Greeneye Loader 1.2.4 or newer. Older copies don't have the functions a dinput8.dll
+must have, so the game won't start with one renamed to dinput8.dll. Several mods ship the loader,
+so take dbgcore.dll from your newest mod download. Once the game starts, the first line of
+greeneye\loader.log shows the loader's version.
+
+Already have a dinput8.dll from another mod (Creative Mode, XHL, ...)? Don't overwrite it. Do
+step 3 first.
+
+
+2. Tell Wine to use the dinput8.dll in the game folder
+------------------------------------------------------
+
+By default Wine uses its own dinput8.dll and ignores the one in the game folder. The setting
+that changes that is:
+
+    WINEDLLOVERRIDES="dinput8=n,b"
+
+"n,b" means native (the file in the game folder) first, then Wine's built-in one. Set it in
+whichever of these places matches how you play.
+
+Steam (Proton), desktop Linux or Steam Deck:
+  1. In your Steam Library, right-click Enshrouded and choose Properties.
+     (Steam Deck Game Mode: select Enshrouded, press the gear button, then Properties.)
+  2. On the General page, find Launch Options and type exactly:
+
+         WINEDLLOVERRIDES="dinput8=n,b" %command%
+
+  3. Close the window. Steam saves it right away.
+
+  If Launch Options already has something in it, put the setting at the very front, and keep
+  only one %command%:
+
+      gamemoderun %command%
+      becomes
+      WINEDLLOVERRIDES="dinput8=n,b" gamemoderun %command%
+
+  If it already has a WINEDLLOVERRIDES, add dinput8 to the same one, separated by a semicolon:
+
+      WINEDLLOVERRIDES="dxgi=n,b" %command%
+      becomes
+      WINEDLLOVERRIDES="dxgi=n,b;dinput8=n,b" %command%
+
+Instead of launch options, you can set it once in the game's Proton prefix with winecfg
+(Enshrouded's Steam app id is 1203620):
+
+      protontricks 1203620 winecfg
+
+  In winecfg, open the Libraries tab, type dinput8 under "New override for library", click
+  Add, and make sure it reads "dinput8 (native, builtin)". Then click OK.
+
+Lutris:
+  Right-click the game > Configure > Runner options > DLL overrides. Add a row with key
+  dinput8 and value n,b. Save.
+
+Plain Wine (your own prefix):
+  Either start the game with
+      WINEDLLOVERRIDES="dinput8=n,b" wine enshrouded.exe
+  or run winecfg for that prefix and add the dinput8 override as described above.
+
+Dedicated server under Wine (start script):
+  Put this line in the script before the line that starts the server:
+      export WINEDLLOVERRIDES="dinput8=n,b"
+  or put it in front of the start command:
+      WINEDLLOVERRIDES="dinput8=n,b" wine enshrouded_server.exe
+
+Dedicated server in Docker (docker-compose.yml):
+  Add it to the container's environment. No quotes in this form:
+      environment:
+        - WINEDLLOVERRIDES=dinput8=n,b
+  With docker run:  -e WINEDLLOVERRIDES=dinput8=n,b
+  If the image already sets WINEDLLOVERRIDES, add ;dinput8=n,b to its value instead.
+
+Server panels (AMP, Pterodactyl, game hosts):
+  Add an environment variable to the server's startup settings:
+      name:   WINEDLLOVERRIDES
+      value:  dinput8=n,b
+  Not every host lets you set environment variables. If yours doesn't, ask their support to
+  add it.
+
+
+3. Already have another dinput8.dll mod? Chain it
+-------------------------------------------------
+
+Only one file can be called dinput8.dll. The loader can load the other mod for you:
+
+  1. Rename the other mod's dinput8.dll to something else, e.g. creative.dll. Keep it in the
+     game folder.
+  2. Copy greeneye\linux\dinput8-chain.ini.example to the game folder as dinput8-chain.ini,
+     and list that file under [Chain]:
+
+         [Chain]
+         creative.dll
+
+  3. Put the loader in as dinput8.dll (step 1).
+
+The loader loads every DLL listed under [Chain] when the game starts, before the game's own
+code runs, which is about when the other mod would have loaded under its own name. EMF, Kiln,
+ShroudForge, XHL and Auto Loot Plus read this same file the same way, so a dinput8-chain.ini you
+already have keeps working, and yours keeps working if you switch loaders. DLLs that EMF's
+installer moved into an [EMF] section are loaded too.
+
+Put "; " in front of a line to switch that DLL off without deleting it. Only DLLs inside the
+game folder count: write creative.dll or mods\mymod\mymod.dll, not a full path.
+
+Chaining works on Windows too, if two of your mods want dinput8.dll. On Windows, though, the
+simpler fix is to leave the loader as dbgcore.dll, where it doesn't need the name.
+
+Don't list the Greeneye Loader itself (dbgcore.dll, or a copy under another name) under
+[Chain]. It's already running as dinput8.dll, so it skips any copy of itself and says so in
+loader.log.
+
+Another loader, like XHL, already owns dinput8.dll and reads dinput8-chain.ini itself? Then you
+can do it the other way round: leave that loader as dinput8.dll and list the Greeneye Loader
+under its [Chain], renamed to something like greeneye-loader.dll (not dinput8.dll). Our mods
+then start as soon as that loader loads it.
+
+
+Both dbgcore.dll and dinput8.dll in the folder?
+-----------------------------------------------
+
+A mod update may put dbgcore.dll back next to your dinput8.dll. Nothing breaks:
+  - On Linux, Wine never loads dbgcore.dll, so it just sits there. You can delete it.
+  - On Windows, both load. One copy runs the mods, and the dinput8.dll copy still loads your
+    chain. greeneye\loader.second-copy.log says which copy runs the mods; if that file says the
+    idle copy is newer, replace the older file with the newer one.
+When the dinput8.dll copy only loads the chain, its log is greeneye\loader.chain.log.
+
+
+4. Check that it works
+----------------------
+
+Start the game or server once, then open greeneye\loader.log. The first line should read
+something like:
+
+    Greeneye Loader 1.2.4 loaded as DINPUT8.dll in enshrouded.exe (game), ... on Wine 9.0
+
+No loader.log at all? Wine didn't use the game folder's dinput8.dll. Check the override
+(step 2). On Steam, make sure %command% is in the launch options.
+
+With a chain, loader.log also lists each chained DLL ("chain: creative.dll started") or
+says why one was skipped.
+
+If a mod or a chained DLL crashes the game while it starts, the loader skips it at the next
+launches and says so in loader.log, until that DLL is updated. To try it again anyway, delete
+greeneye\crashguard.txt.
+
+When reporting a problem, please attach greeneye\loader.log.

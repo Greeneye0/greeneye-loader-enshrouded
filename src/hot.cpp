@@ -522,6 +522,7 @@ Generation* Load(Mod& mod, std::string& why)
     h.redirectCall = &RedirectCall;
     h.poll = &Poll;
     h.keep = &Keep;
+    h.loader = GlLoaderName();
     Generation* raw = g.get();
     mod.generations.push_back(std::move(g)); // retained even if it never starts
     return raw;
@@ -919,6 +920,163 @@ std::string StartMod(const ModInfo& info)
     if (g_hotReload)
         Status(mod, ok ? outcome : "error: " + outcome);
     return ok ? "started (" + outcome + ")" : outcome;
+}
+
+// --- greeneye\hooks.txt: every place the loader patched, who owns it, and what was there -------
+
+namespace {
+
+// Where the exe on disk has the bytes of rva: its file offset, or 0.
+DWORD FileOffset(const uint8_t* base, DWORD rva)
+{
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+        if (rva >= sec->VirtualAddress && rva < sec->VirtualAddress + sec->SizeOfRawData)
+            return sec->PointerToRawData + (rva - sec->VirtualAddress);
+    return 0;
+}
+
+// The exe's 64-bit relocations (their RVAs, sorted): those bytes differ from the file by design.
+std::vector<DWORD> Relocations(const uint8_t* base)
+{
+    std::vector<DWORD> out;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    const uint8_t* p = base + dir.VirtualAddress;
+    const uint8_t* end = p + dir.Size;
+    while (dir.VirtualAddress && p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
+        auto block = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(p);
+        if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION))
+            break;
+        auto entries = reinterpret_cast<const WORD*>(block + 1);
+        size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        for (size_t i = 0; i < count; ++i)
+            if ((entries[i] >> 12) == IMAGE_REL_BASED_DIR64)
+                out.push_back(block->VirtualAddress + (entries[i] & 0xFFF));
+        p += block->SizeOfBlock;
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::string ModuleOf(const void* p)
+{
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH];
+    if (!p || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  static_cast<LPCWSTR>(p), &m) ||
+        !GetModuleFileNameW(m, path, MAX_PATH))
+        return "";
+    const wchar_t* name = wcsrchr(path, L'\\');
+    return Narrow(name ? name + 1 : path);
+}
+
+// Hooking libraries jump first to a small stub in allocated memory, which jumps on into the
+// module. Follows such jumps (a few hops, readable memory only) to name that module.
+std::string ModuleBehind(const void* p)
+{
+    for (int hop = 0; hop < 4 && p; ++hop) {
+        std::string name = ModuleOf(p);
+        if (!name.empty())
+            return name;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            !(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_READONLY | PAGE_READWRITE)) ||
+            static_cast<const uint8_t*>(p) + 16 > static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize)
+            return "";
+        auto code = static_cast<const uint8_t*>(p);
+        if (jumppatch::KindOf(code) == jumppatch::None)
+            return "";
+        p = jumppatch::Destination(code);
+    }
+    return "";
+}
+
+} // namespace
+
+void WriteHookList()
+{
+    auto base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    HANDLE file = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    const std::vector<DWORD> relocs = Relocations(base);
+    FILE* out = _wfopen((g_modsDir + L"hooks.txt").c_str(), L"w");
+    if (!out) {
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);
+        return;
+    }
+    fputs("# Every place in the game's code the Greeneye Loader patched at game start, and the mod that owns it.\n"
+          "# \"before us\": the bytes there were not the game's own when the loader hooked it, so another mod or tool\n"
+          "# patched that place first (the loader hooks behind a jump it finds). Hook sites a hot reload added later\n"
+          "# are not listed.\n",
+          out);
+    AcquireSRWLockShared(&g_slotsLock);
+    std::vector<const uint8_t*> seen;
+    unsigned places = 0;
+    std::map<std::string, unsigned> foreign; // "Quick Deposit behind creative.dll" -> places
+    for (const auto& sp : g_slots) {
+        const Slot& s = *sp;
+        if (s.staged)
+            continue;
+        const bool first = std::find(seen.begin(), seen.end(), s.target) == seen.end();
+        const DWORD rva = static_cast<DWORD>(s.target - base);
+        fprintf(out, "exe+0x%06lx  %-4s %2zu bytes  %s", rva, s.call ? "call" : "hook", s.length,
+                s.owner ? s.owner->info.name.c_str() : "?");
+        if (!first) {
+            fputs("  (also hooked by a mod listed above)\n", out);
+            continue;
+        }
+        seen.push_back(s.target);
+        ++places;
+        // What was there when the loader came: the game's bytes, or someone else's patch.
+        std::string note;
+        uint8_t disk[32] = {};
+        DWORD got = 0, at = FileOffset(base, rva);
+        LARGE_INTEGER pos;
+        pos.QuadPart = at;
+        bool read = file != INVALID_HANDLE_VALUE && at && SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) &&
+                    ReadFile(file, disk, static_cast<DWORD>(s.length), &got, nullptr) && got == s.length;
+        bool same = true;
+        for (size_t i = 0; read && i < s.length; ++i) {
+            // Skip bytes covered by a relocation (an absolute address the OS rewrote).
+            auto r = std::upper_bound(relocs.begin(), relocs.end(), static_cast<DWORD>(rva + i));
+            bool relocated = r != relocs.begin() && rva + i < *(r - 1) + 8;
+            if (!relocated && s.saved[i] != disk[i])
+                same = false;
+        }
+        if (!read) {
+            note = "  (could not compare with the exe on disk)";
+        } else if (!same) {
+            // s.base: the callee of a call, or the destination of the jump the loader found and
+            // hooked behind; for anything else the bytes simply differ.
+            const bool jump = s.call || jumppatch::KindOf(s.saved) != jumppatch::None;
+            std::string who = jump ? ModuleBehind(s.base) : "";
+            if (!jump)
+                note = "  << changed before us (the bytes differ from the exe on disk)";
+            else
+                note = "  << patched before us" + (who.empty() ? std::string(" (goes to memory no module owns: another mod's hook)")
+                                                               : " (goes into " + who + ")");
+            ++foreign[std::string(s.owner ? s.owner->info.name : "?") + (who.empty() ? "" : " behind " + who)];
+        }
+        fprintf(out, "%s\n", note.c_str());
+    }
+    ReleaseSRWLockShared(&g_slotsLock);
+    fclose(out);
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+    std::string summary;
+    unsigned before = 0;
+    for (const auto& [who, count] : foreign) {
+        summary += (summary.empty() ? "" : ", ") + who + (count > 1 ? " (" + std::to_string(count) + ")" : "");
+        before += count;
+    }
+    if (summary.empty())
+        Log("hooks.txt: %u places patched, none patched by anything else first", places);
+    else
+        Log("hooks.txt: %u places patched; %u of them were patched by something else first: %s", places, before, summary.c_str());
 }
 
 void StartWatcher()

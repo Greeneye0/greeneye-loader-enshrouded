@@ -2,6 +2,8 @@
 //
 // Installed as dbgcore.dll next to enshrouded.exe / enshrouded_server.exe (or renamed to
 // umpdc.dll or cfgmgr32.dll if another mod already uses that name: tools/proxyprobe/RESULTS.md).
+// On Linux (Proton or Wine) it is renamed to dinput8.dll, the one name Wine loads from the game
+// folder: dinput8_proxy.cpp.
 // Every export of those three System32 DLLs is forwarded to the real one by the Windows loader
 // itself (exports.h), so the loader has no code in any call the game makes.
 //
@@ -83,6 +85,16 @@ int g_side = 0;
 std::wstring g_gameDir, g_modsDir;
 std::string g_selfName;
 bool g_started = false;
+
+// "Wine 9.0" under Wine or Proton (ntdll exports wine_get_version there), else empty.
+std::string WineVersion()
+{
+    using Fn = const char*(__cdecl*)();
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto fn = ntdll ? reinterpret_cast<Fn>(GetProcAddress(ntdll, "wine_get_version")) : nullptr;
+    const char* v = fn ? fn() : nullptr;
+    return fn ? std::string("Wine ") + (v ? v : "?") : std::string();
+}
 
 long long MsSinceStart()
 {
@@ -212,14 +224,166 @@ void StartMods()
     FindClose(find);
 
     // A DLL that fails to start stays loaded: it may already have done something.
-    for (const hot::ModInfo& m : mods)
-        Log("%s %s: %s", m.name.c_str(), m.version.c_str(), hot::StartMod(m).c_str());
+    for (const hot::ModInfo& m : mods) {
+        if (GuardSkip("mod", m.id, m.dll)) {
+            Log("%s %s: skipped: it crashed the game while starting before, and its DLL hasn't changed since "
+                "(delete greeneye\\crashguard.txt to try it again)",
+                m.name.c_str(), m.version.c_str());
+            continue;
+        }
+        GuardBegin("mod", m.id, m.dll);
+        const std::string outcome = hot::StartMod(m);
+        GuardEnd();
+        Log("%s %s: %s", m.name.c_str(), m.version.c_str(), outcome.c_str());
+    }
     // Last, so it runs first in the frame, before any mod's hook of the same function.
     hot::InstallSafePoint();
+    hot::WriteHookList();
     hot::StartWatcher();
 }
 
 // --- the exe's entry point: start the mods there when loaded during process start ----------
+
+// "1.2.3 as dbgcore.dll" < "1.2.4": compares the leading dotted numbers.
+bool VersionLess(const char* a, const char* b)
+{
+    for (;;) {
+        char* endA;
+        char* endB;
+        long x = strtol(a, &endA, 10), y = strtol(b, &endB, 10);
+        if (x != y)
+            return x < y;
+        if (*endA != '.' || *endB != '.')
+            return *endA != '.' && *endB == '.';
+        a = endA + 1;
+        b = endB + 1;
+    }
+}
+
+HMODULE g_self = nullptr;
+std::string g_loaderName = "Greeneye Loader " GL_VERSION;
+bool g_runMods = false, g_chainHost = false, g_hasMods = false, g_startupLoad = false;
+long long g_loadMs = 0;
+std::wstring g_exeName;
+
+// --- several copies of the loader in one process: the newest runs the mods -------------------
+// The per-process claim (greeneye::ClaimProcess "Loader", Local\Greeneye-Loader-<pid>) is still
+// taken in DllMain, as every loader since 1.1 does: other hosts read it before the entry point
+// (Kiln's kiln-greeneye steps aside when it is held). Which of OUR copies then runs the mods is
+// decided at the exe's entry point, when every copy loaded at process start (e.g. dbgcore.dll from
+// a mod zip and dinput8.dll from the Linux guide) has written its version here: the newest one.
+// A claim already held by a copy before 1.2.4 (claimedByNew 0) stays theirs.
+
+struct Copies {
+    volatile LONG best;         // highest version, major*1000000 + minor*1000 + patch
+    char bestName[64];          // "1.2.4 as dbgcore.dll"
+    volatile LONG claimedByNew; // the claim was taken by a 1.2.4+ copy (one that writes here)
+    volatile LONG running;      // a copy has taken the mods at the entry point
+};
+Copies* g_copies = nullptr;
+bool g_claimHeld = false;   // this copy took the per-process claim in DllMain
+bool g_oldOwnsClaim = false; // a copy before 1.2.4 holds it: it runs the mods
+
+LONG VersionNumber(const char* v)
+{
+    long major = strtol(v, const_cast<char**>(&v), 10);
+    long minor = *v == '.' ? strtol(v + 1, const_cast<char**>(&v), 10) : 0;
+    long patch = *v == '.' ? strtol(v + 1, nullptr, 10) : 0;
+    return major * 1000000 + minor * 1000 + patch;
+}
+
+void RegisterCopy()
+{
+    wchar_t name[96];
+    swprintf_s(name, L"Local\\Greeneye-LoaderCopies-%lu", GetCurrentProcessId());
+    // Never closed: it lives as long as the process.
+    HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Copies), name);
+    if (!map)
+        return;
+    g_copies = static_cast<Copies*>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Copies)));
+    if (!g_copies)
+        return;
+    const LONG mine = VersionNumber(GL_VERSION);
+    // DllMains run one at a time (loader lock), so name and number stay together.
+    if (mine > g_copies->best) {
+        g_copies->best = mine;
+        snprintf(g_copies->bestName, sizeof(g_copies->bestName), "%s as %s", GL_VERSION, g_selfName.c_str());
+    }
+}
+
+// In DllMain, start-up loads with a greeneye folder: the per-process claim, for other hosts to see.
+void TakeClaim()
+{
+    if (greeneye::ClaimProcess(L"Loader")) { // kept open for the process life
+        g_claimHeld = true;
+        if (g_copies)
+            g_copies->claimedByNew = 1;
+    } else {
+        g_oldOwnsClaim = !g_copies || !g_copies->claimedByNew;
+    }
+}
+
+// At the entry point (or a late load): does this copy run the mods?
+bool RunsTheMods()
+{
+    if (!g_startupLoad) // late (or the entry point couldn't be hooked): the first claim wins, as always
+        return g_claimHeld || greeneye::ClaimProcess(L"Loader");
+    if (g_oldOwnsClaim || !g_copies)
+        return g_claimHeld; // no registry: the claim decides
+    if (g_copies->best > VersionNumber(GL_VERSION))
+        return false; // a newer copy takes them
+    return InterlockedCompareExchange(&g_copies->running, 1, 0) == 0; // equal versions: the first here
+}
+
+// Runs the mods, or leaves them to another copy. Then the chain and the mods start.
+void StartAll()
+{
+    if (g_hasMods) {
+        const bool newest = !g_startupLoad || !g_copies || g_copies->best <= VersionNumber(GL_VERSION);
+        if (RunsTheMods()) {
+            g_runMods = true;
+            g_loaderName = "Greeneye Loader " GL_VERSION " as " + g_selfName;
+            SetEnvironmentVariableA("GREENEYE_LOADER", (GL_VERSION " as " + g_selfName).c_str());
+        } else {
+            char owner[96] = "";
+            GetEnvironmentVariableA("GREENEYE_LOADER", owner, sizeof(owner));
+            if (!*owner && !newest && g_copies)
+                snprintf(owner, sizeof(owner), "%s", g_copies->bestName);
+            if (FILE* f = _wfopen((g_modsDir + L"loader.second-copy.log").c_str(), L"w")) {
+                fprintf(f, "Greeneye Loader " GL_VERSION " as %s: another copy (%s) runs the mods in this process, so this one "
+                           "leaves them to it%s\n",
+                        g_selfName.c_str(), *owner ? owner : "1.2.3 or older",
+                        g_chainHost ? "; it still loads dinput8-chain.ini" : "");
+                if (!*owner || VersionLess(owner, GL_VERSION))
+                    fprintf(f, "This copy is newer: replace the other one with it, or delete the other one.\n");
+                fclose(f);
+            }
+        }
+    }
+    if (!g_runMods && !g_chainHost)
+        return;
+
+    // The chain host that leaves the mods to another copy writes its chain lines to a log of its
+    // own, so they aren't lost.
+    const std::wstring logDir = g_hasMods ? g_modsDir : g_gameDir;
+    g_logPath = logDir + (g_runMods ? L"loader.log" : L"loader.chain.log");
+    g_oldLogPath = logDir + (g_runMods ? L"loader.old.log" : L"loader.chain.old.log");
+    g_log.Open(_wfsopen(g_logPath.c_str(), L"w", _SH_DENYWR), &RollIfFull);
+    const std::string wine = WineVersion();
+    Log("Greeneye Loader " GL_VERSION " loaded as %s in %s (%s), %lld ms after start, %s load%s%s", g_selfName.c_str(),
+        Narrow(g_exeName).c_str(), g_side == kGreeneyeServer ? "server" : "game", g_loadMs,
+        g_startupLoad ? "start-up" : "late", wine.empty() ? "" : ", on ", wine.c_str());
+    if (g_startupLoad)
+        Log(g_runMods ? "mods start at the entry point" : "the chain loads at the entry point");
+    GuardInit(logDir);
+
+    // The chained dinput8 mods first (they would have loaded before the exe's entry point as
+    // dinput8.dll themselves), then the Greeneye mods.
+    if (g_chainHost)
+        LoadChain(g_gameDir, g_self);
+    if (g_runMods)
+        StartMods();
+}
 
 using EntryFn = DWORD(WINAPI*)(void* peb);
 uint8_t* g_entry = nullptr;
@@ -234,7 +398,7 @@ DWORD WINAPI EntryHook(void* peb)
         VirtualProtect(g_entry, sizeof(g_savedEntry), old, &old);
         FlushInstructionCache(GetCurrentProcess(), g_entry, sizeof(g_savedEntry));
     }
-    StartMods();
+    StartAll();
     return reinterpret_cast<EntryFn>(g_entry)(peb);
 }
 
@@ -262,6 +426,11 @@ bool HookEntryPoint()
 
 } // namespace
 
+const char* GlLoaderName()
+{
+    return g_loaderName.c_str();
+}
+
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 {
     if (reason != DLL_PROCESS_ATTACH)
@@ -282,35 +451,42 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
     wchar_t self_[MAX_PATH];
     GetModuleFileNameW(self, self_, MAX_PATH);
     const wchar_t* selfName = wcsrchr(self_, L'\\');
-    g_selfName = Narrow(selfName ? selfName + 1 : self_);
+    selfName = selfName ? selfName + 1 : self_;
+    g_selfName = Narrow(selfName);
     wchar_t game[MAX_PATH];
     greeneye::GameDir(game, MAX_PATH);
     g_gameDir = game;
     g_modsDir = g_gameDir + L"greeneye\\";
-    if (GetFileAttributesW(g_modsDir.c_str()) == INVALID_FILE_ATTRIBUTES)
-        return TRUE; // nothing to load
+    g_self = self;
 
-    if (!greeneye::ClaimProcess(L"Loader")) {
-        // A second copy under another name (e.g. dbgcore.dll and umpdc.dll both present).
-        if (FILE* f = _wfopen((g_modsDir + L"loader.second-copy.log").c_str(), L"w")) {
-            fprintf(f, "Greeneye Loader " GL_VERSION " as %s: another copy already runs in this process, so this one stays idle\n",
-                    g_selfName.c_str());
-            fclose(f);
-        }
-        return TRUE;
-    }
-    g_logPath = g_modsDir + L"loader.log";
-    g_oldLogPath = g_modsDir + L"loader.old.log";
-    g_log.Open(_wfsopen(g_logPath.c_str(), L"w", _SH_DENYWR), &RollIfFull);
-    Log("Greeneye Loader " GL_VERSION " loaded as %s in %s (%s), %lld ms after start, %s load", g_selfName.c_str(),
-        Narrow(exeName).c_str(), g_side == kGreeneyeServer ? "server" : "game", MsSinceStart(),
-        reserved ? "start-up" : "late");
+    // Two jobs: the Greeneye mods (one copy per process: ClaimProcess) and, as dinput8.dll, the
+    // other dinput8 mods in dinput8-chain.ini. Only one module can be dinput8.dll, so the chain
+    // needs no claim, and it loads even when another copy (e.g. dbgcore.dll) runs the mods.
+    // Chain host only as the game's own dinput8.dll: in the game folder and the process's module
+    // of that name. A copy named dinput8.dll that someone else's chain loader loads from another
+    // folder leaves dinput8-chain.ini to that loader (it is usually theirs).
+    const std::wstring selfDir(self_, static_cast<size_t>(selfName - self_));
+    g_chainHost = _wcsicmp(selfName, L"dinput8.dll") == 0 && _wcsicmp(selfDir.c_str(), g_gameDir.c_str()) == 0 &&
+                  GetModuleHandleW(L"dinput8.dll") == self &&
+                  GetFileAttributesW((g_gameDir + L"dinput8-chain.ini").c_str()) != INVALID_FILE_ATTRIBUTES;
+    g_hasMods = GetFileAttributesW(g_modsDir.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!g_hasMods && !g_chainHost)
+        return TRUE; // nothing to load
+    g_exeName = exeName;
+    g_loadMs = MsSinceStart();
 
     // Start-up load: wait for the entry point (single-threaded, no loader lock, before any game
-    // code). Late load: the game already runs, so start now.
-    if (reserved && HookEntryPoint())
-        Log("mods start at the entry point");
-    else
-        StartMods();
+    // code; every copy loaded at start-up has registered by then). Late load: the game already
+    // runs, so start now.
+    g_startupLoad = reserved != nullptr;
+    if (g_startupLoad) {
+        RegisterCopy();
+        if (g_hasMods)
+            TakeClaim();
+    }
+    if (!g_startupLoad || !HookEntryPoint()) {
+        g_startupLoad = false;
+        StartAll();
+    }
     return TRUE;
 }

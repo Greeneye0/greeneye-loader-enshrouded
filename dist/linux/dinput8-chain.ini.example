@@ -1,0 +1,15 @@
+; dinput8-chain.ini: other mods that want the name dinput8.dll, started by whichever loader holds
+; that name. The Greeneye Loader, EMF, Kiln, ShroudForge, XHL-Core and Auto Loot Plus all read this
+; file the same way (EMF's shared spec), so this list keeps working if you switch loaders.
+;
+; To use it: copy this file to the game folder (next to enshrouded.exe) as dinput8-chain.ini,
+; rename the other mod's dinput8.dll (e.g. to creative.dll), and list that name under [Chain].
+;
+; - One DLL per line, relative to the game folder: creative.dll or mods\mymod\mymod.dll
+; - Lines starting with ; # or // are comments. "; " in front of a DLL switches it off.
+; - A comment may follow a name after a space or tab: creative.dll ; Creative Mode
+; - Only .dll files inside the game folder; full paths and ".." are refused.
+; - The game's DirectInput always goes to Windows' own dinput8.dll, not to the DLLs listed here.
+
+[Chain]
+; creative.dll

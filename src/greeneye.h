@@ -12,7 +12,9 @@
 #include <cstddef>
 #include <cwchar>
 
-constexpr uint32_t kGreeneyeApiVersion = 2;
+// The host's API. 3 (loader 1.2.4) only adds GreeneyeHost::loader, so mods keep "api": 2 in
+// mod.json and still load under API 2 hosts (older loaders, Kiln's adapter).
+constexpr uint32_t kGreeneyeApiVersion = 3;
 
 enum GreeneyeSide : int { kGreeneyeClient = 1, kGreeneyeServer = 2 };
 
@@ -54,6 +56,10 @@ struct GreeneyeHost {
     // Zeroed memory of size bytes, the same for every generation of this mod (state that must
     // survive a reload). The first call with a key decides the size.
     void* (*keep)(const char* key, size_t size);
+
+    // API 3 (loader 1.2.4): who runs the mods, e.g. "Greeneye Loader 1.2.4 as dbgcore.dll".
+    // Read it only through greeneye::LoaderName / HostNamesLoader (apiVersion >= 3 and size).
+    const char* loader;
 };
 
 // Exported by every mod: start the mod, return true if it is running.
@@ -172,7 +178,10 @@ inline bool HostOk(const GreeneyeHost* host)
 // The loader offers API 2 (hooks through the loader, leases, reloads).
 inline bool HostHasHooks(const GreeneyeHost* host)
 {
-    return HostOk(host) && host->apiVersion >= 2 && host->size >= sizeof(GreeneyeHost) && host->hook && host->enter;
+    // Up to keep, the last API 2 field: later fields (loader) are optional, so a host from an older
+    // loader or another one still counts.
+    return HostOk(host) && host->apiVersion >= 2 && host->size >= offsetof(GreeneyeHost, keep) + sizeof(host->keep) &&
+           host->hook && host->enter;
 }
 
 // This module's host, once the mod has started under the loader with API 2 (null standalone).
@@ -182,9 +191,35 @@ inline const GreeneyeHost*& Host()
     return host;
 }
 
+// The host names its loader (API 3). Both the API version and the size must say so: another
+// host built from an API 2 copy of this header may have appended fields of its own after keep,
+// and those must never be read as this one.
+inline bool HostNamesLoader(const GreeneyeHost* host)
+{
+    return HostOk(host) && host->apiVersion >= 3 && host->size >= offsetof(GreeneyeHost, loader) + sizeof(host->loader) &&
+           host->loader;
+}
+
+// Which loader runs this mod, for the mod's own log or a support report.
+inline const char* LoaderName(const GreeneyeHost* host)
+{
+    if (HostNamesLoader(host))
+        return host->loader;
+    return host ? "a loader that doesn't name itself (Greeneye Loader 1.2.3 or older, or another loader such as Kiln)"
+                : "no loader (standalone)";
+}
+
 inline void UseHost(const GreeneyeHost* host)
 {
     Host() = HostHasHooks(host) ? host : nullptr;
+    // A host that doesn't name itself gets one line from each mod's first start, so a log from
+    // another loader shows it at once (the Greeneye Loader names itself in its own first line).
+    const bool first = host && (host->size < offsetof(GreeneyeHost, generation) + sizeof(host->generation) || host->generation <= 1);
+    if (HostOk(host) && first && !HostNamesLoader(host)) {
+        char line[256];
+        snprintf(line, sizeof(line), "  (this mod runs under %s)", LoaderName(host));
+        host->log(line);
+    }
 }
 
 // A reload (generation 2 and later) belongs to the process the first generation claimed.
